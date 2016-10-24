@@ -38,8 +38,11 @@ import java.util.logging.Logger;
  */
 public class JavacHolder {
     private static final Logger LOG = Logger.getLogger("main");
+    /** Where this javac looks for library .class files */
     public final Set<Path> classPath;
+    /** Where this javac looks for .java source files */
     public final Set<Path> sourcePath;
+    /** Where this javac places generated .class files */
     public final Path outputDirectory;
     // javac places all of its internal state into this Context object,
     // which is basically a Map<String, Object>
@@ -73,8 +76,9 @@ public class JavacHolder {
         options.put("-Xlint:varargs", "");
         options.put("-Xlint:static", "");
     }
+
+    // Pre-register some custom components before javac initializes
     
-    // IncrementalLog registers itself in context and pre-empts the normal Log from being created
     private final Log log = Log.instance(context);
 
     {
@@ -84,8 +88,10 @@ public class JavacHolder {
     public final JavacFileManager fileManager = new JavacFileManager(context, true, null);
     private final ForgivingAttr attr = ForgivingAttr.instance(context);
     private final Check check = Check.instance(context);
-    // FuzzyParserFactory registers itself in context and pre-empts the normal ParserFactory from being created
     private final FuzzyParserFactory parserFactory = FuzzyParserFactory.instance(context);
+    
+    // Initialize javac
+
     public final JavaCompiler compiler = JavaCompiler.instance(context);
 
     {
@@ -93,13 +99,15 @@ public class JavacHolder {
         compiler.keepComments = true;
     }
 
+    // javac has already been initialized, fetch a few components for easy access
+
     private final Todo todo = Todo.instance(context);
     private final JavacTrees trees = JavacTrees.instance(context);
     private final Types types = Types.instance(context);
 
     public JavacHolder(Set<Path> classPath, Set<Path> sourcePath, Path outputDirectory) {
-        this.classPath = classPath;
-        this.sourcePath = sourcePath;
+        this.classPath = Collections.unmodifiableSet(classPath);
+        this.sourcePath = Collections.unmodifiableSet(sourcePath);
         this.outputDirectory = outputDirectory;
 
         options.put("-classpath", Joiner.on(File.pathSeparator).join(classPath));
@@ -126,6 +134,9 @@ public class JavacHolder {
         clearOutputDirectory(outputDirectory);
     }
 
+    /** 
+     * Ensure output directory exists 
+     */
     private void ensureOutputDirectory(Path dir) {
         if (!Files.exists(dir)) {
             try {
@@ -138,6 +149,9 @@ public class JavacHolder {
             throw ShowMessageException.error("Output directory " + dir + " is not a directory", null);
     }
 
+    /** 
+     * Set all .class files to modified-at 1970 so javac won't skip them when we invoke it 
+     */
     private static void clearOutputDirectory(Path file) {
         try {
             if (file.getFileName().toString().endsWith(".class")) {
@@ -170,27 +184,31 @@ public class JavacHolder {
         return result;
     }
 
+    /**
+     * Compile a set of parsed files.
+     * 
+     * If these files reference un-parsed dependencies, those dependencies will also be parsed and compiled.
+     */
     public void compile(Collection<JCTree.JCCompilationUnit> parsed) {
         compiler.processAnnotations(compiler.enterTrees(com.sun.tools.javac.util.List.from(parsed)));
 
         while (!todo.isEmpty()) {
-            // We don't do the desugar or generate phases, because they remove method bodies and methods
             Env<AttrContext> next = todo.remove();
-            Env<AttrContext> attributedTree = compiler.attribute(next);
-            Queue<Env<AttrContext>> analyzedTree = compiler.flow(attributedTree);
+
+            try {
+                // We don't do the desugar or generate phases, because they remove method bodies and methods
+                Env<AttrContext> attributedTree = compiler.attribute(next);
+                Queue<Env<AttrContext>> analyzedTree = compiler.flow(attributedTree);
+            } catch (Exception e) {
+                LOG.log(Level.SEVERE, "Error compiling " + next.toplevel.sourcefile.getName(), e);
+
+                // Keep going
+            }
         }
-    }
-    
-    /**
-     * Compile a source tree produced by this.parse
-     */
-    // TODO inline
-    public void compile(JCTree.JCCompilationUnit source) {
-        compile(Collections.singleton(source));
     }
 
     /**
-     * Remove source file from caches in the parse stage
+     * Clear a file from javac's internal caches
      */
     public void clear(JavaFileObject source) {
         // TODO clear dependencies as well (dependencies should get stored in SymbolIndex)
@@ -220,6 +238,9 @@ public class JavacHolder {
 
     }
 
+    /** 
+     * Reflectively invokes Types.closureCache.remove(Type) 
+     */
     private static Consumer<Type> closureCacheRemover(Types types) {
         try {
             Field closureCache = Types.class.getDeclaredField("closureCache");
@@ -234,6 +255,9 @@ public class JavacHolder {
         }
     }
 
+    /** 
+     * Reflectively invokes Log.sourceMap.remove(JavaFileObject) 
+     */
     private static Consumer<JavaFileObject> logRemover(Log log) {
         try {
             Field sourceMap = AbstractLog.class.getDeclaredField("sourceMap");

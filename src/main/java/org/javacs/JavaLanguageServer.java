@@ -2,6 +2,8 @@ package org.javacs;
 
 import com.sun.tools.javac.tree.JCTree;
 import com.sun.tools.javac.code.Symbol;
+import com.sun.tools.javac.tree.TreeInfo;
+import com.sun.tools.javac.tree.TreeScanner;
 import io.typefox.lsapi.services.*;
 import io.typefox.lsapi.*;
 import io.typefox.lsapi.impl.*;
@@ -31,7 +33,7 @@ class JavaLanguageServer implements LanguageServer {
     private Path workspaceRoot;
     private Consumer<PublishDiagnosticsParams> publishDiagnostics = p -> {};
     private Consumer<MessageParams> showMessage = m -> {};
-    private Map<Path, String> sourceByPath = new HashMap<>();
+    private Map<Path, String> activeDocuments = new HashMap<>();
 
     public JavaLanguageServer() {
         this.testJavac = Optional.empty();
@@ -181,15 +183,15 @@ class JavaLanguageServer implements LanguageServer {
                 try {
                     TextDocumentItem document = params.getTextDocument();
                     URI uri = URI.create(document.getUri());
-                    Optional<Path> path = getFilePath(uri);
+                    Optional<Path> maybePath = getFilePath(uri);
 
-                    if (path.isPresent()) {
+                    maybePath.ifPresent(path -> {
                         String text = document.getText();
 
-                        sourceByPath.put(path.get(), text);
+                        activeDocuments.put(path, text);
 
-                        doLint(path.get());
-                    }
+                        doLint(path);
+                    });
                 } catch (NoJavaConfigException e) {
                     throw ShowMessageException.warning(e.getMessage(), e);
                 }
@@ -204,12 +206,12 @@ class JavaLanguageServer implements LanguageServer {
                 if (path.isPresent()) {
                     for (TextDocumentContentChangeEvent change : params.getContentChanges()) {
                         if (change.getRange() == null)
-                            sourceByPath.put(path.get(), change.getText());
+                            activeDocuments.put(path.get(), change.getText());
                         else {
-                            String existingText = sourceByPath.get(path.get());
+                            String existingText = activeDocuments.get(path.get());
                             String newText = patch(existingText, change);
 
-                            sourceByPath.put(path.get(), newText);
+                            activeDocuments.put(path.get(), newText);
                         }
                     }
                 }
@@ -226,7 +228,7 @@ class JavaLanguageServer implements LanguageServer {
                     JavaFileObject file = findFile(compiler, path.get());
                     
                     // Remove from source cache
-                    sourceByPath.remove(path.get());
+                    activeDocuments.remove(path.get());
                 }
             }
 
@@ -234,11 +236,15 @@ class JavaLanguageServer implements LanguageServer {
             public void didSave(DidSaveTextDocumentParams params) {
                 TextDocumentIdentifier document = params.getTextDocument();
                 URI uri = URI.create(document.getUri());
-                Optional<Path> path = getFilePath(uri);
+                Optional<Path> maybePath = getFilePath(uri);
 
-                // TODO re-lint dependencies as well as changed files
-                if (path.isPresent())
-                    doLint(path.get());
+                // Re-lint all active documents
+                // 
+                // We would prefer to just re-lint the documents that the user can see
+                // But there is no didSwitchTo(document) event, so we have no way of knowing when the user switches between tabs
+                // Therefore, we just re-lint all open editors
+                if (maybePath.isPresent()) 
+                    doLint(activeDocuments.keySet());
             }
 
             @Override
@@ -294,23 +300,48 @@ class JavaLanguageServer implements LanguageServer {
     }
 
     private void doLint(Path path) {
-        LOG.info("Lint " + path);
+        doLint(Collections.singleton(path));
+    }
+
+    private void doLint(Collection<Path> paths) {
+        LOG.info("Lint " + paths);
 
         DiagnosticCollector<JavaFileObject> errors = new DiagnosticCollector<>();
 
-        JavacHolder compiler = findCompiler(path);
-        SymbolIndex index = findIndex(path);
-        JavaFileObject file = findFile(compiler, path);
+        Map<JavacConfig, Set<JCTree.JCCompilationUnit>> parsedByConfig = new HashMap<>();
 
-        compiler.onError(errors);
+        // Parse all files and group them by compiler
+        for (Path path : paths) {
+            findConfig(path).ifPresent(config -> {
+                Set<JCTree.JCCompilationUnit> collect = parsedByConfig.computeIfAbsent(config, newCompiler -> new HashSet<>());
 
-        JCTree.JCCompilationUnit parsed = compiler.parse(file);
+                // Find the relevant compiler
+                JavacHolder compiler = findCompilerForConfig(config);
 
-        compiler.compile(parsed);
+                compiler.onError(errors);
 
-        index.update(parsed, compiler.context);
+                // Parse the file
+                JavaFileObject file = findFile(compiler, path);
+                JCTree.JCCompilationUnit parsed = compiler.parse(file);
 
-        publishDiagnostics(Collections.singleton(path), errors);
+                collect.add(parsed);
+            });
+        }
+
+
+        for (JavacConfig config : parsedByConfig.keySet()) {
+            Set<JCTree.JCCompilationUnit> parsed = parsedByConfig.get(config);
+            JavacHolder compiler = findCompilerForConfig(config);
+            SymbolIndex index = findIndexForConfig(config);
+
+            compiler.compile(parsed);
+
+            // TODO compiler should do this automatically
+            for (JCTree.JCCompilationUnit compilationUnit : parsed) 
+                index.update(compilationUnit, compiler.context);
+        }
+
+        publishDiagnostics(paths, errors);
     }
 
     @Override
@@ -437,20 +468,22 @@ class JavaLanguageServer implements LanguageServer {
     /**
      * Look for a configuration in a parent directory of uri
      */
-    public JavacHolder findCompiler(Path path) {
+    private JavacHolder findCompiler(Path path) {
         if (testJavac.isPresent())
             return testJavac.get();
 
         Path dir = path.getParent();
-        Optional<JavacConfig> config = findConfig(dir);
         
-        // If config source path doesn't contain source file, then source file has no config
-        if (config.isPresent() && !config.get().sourcePath.stream().anyMatch(s -> path.startsWith(s)))
-            throw new NoJavaConfigException(path.getFileName() + " is not on the source path");
-        
-        Optional<JavacHolder> maybeHolder = config.map(c -> compilerCache.computeIfAbsent(c, this::newJavac));
+        return findConfig(dir)
+            .map(this::findCompilerForConfig)
+            .orElseThrow(() -> new NoJavaConfigException(path));
+    }
 
-        return maybeHolder.orElseThrow(() -> new NoJavaConfigException(path));
+    private JavacHolder findCompilerForConfig(JavacConfig config) {
+        if (testJavac.isPresent())
+            return testJavac.get();
+        else
+            return compilerCache.computeIfAbsent(config, this::newJavac);
     }
 
     private JavacHolder newJavac(JavacConfig c) {
@@ -461,16 +494,20 @@ class JavaLanguageServer implements LanguageServer {
 
     private Map<JavacConfig, SymbolIndex> indexCache = new HashMap<>();
 
-    public SymbolIndex findIndex(Path path) {
+    private SymbolIndex findIndex(Path path) {
         Path dir = path.getParent();
         Optional<JavacConfig> config = findConfig(dir);
-        Optional<SymbolIndex> index = config.map(c -> indexCache.computeIfAbsent(c, this::newIndex));
+        Optional<SymbolIndex> index = config.map(this::findIndexForConfig);
 
         return index.orElseThrow(() -> new NoJavaConfigException(path));
     }
 
+    private SymbolIndex findIndexForConfig(JavacConfig config) {
+        return indexCache.computeIfAbsent(config, this::newIndex);
+    }
+
     private SymbolIndex newIndex(JavacConfig c) {
-        return new SymbolIndex(c.classPath, c.sourcePath, c.outputDirectory, this::publishDiagnostics);
+        return new SymbolIndex(c.classPath, c.sourcePath, c.outputDirectory);
     }
 
     // TODO invalidate cache when VSCode notifies us config file has changed
@@ -499,7 +536,7 @@ class JavaLanguageServer implements LanguageServer {
     /**
      * If directory contains a config file, for example javaconfig.json or an eclipse project file, read it.
      */
-    public Optional<JavacConfig> readIfConfig(Path dir) {
+    private Optional<JavacConfig> readIfConfig(Path dir) {
         if (Files.exists(dir.resolve("javaconfig.json"))) {
             JavaConfigJson json = readJavaConfigJson(dir.resolve("javaconfig.json"));
             Set<Path> classPath = json.classPathFile.map(classPathFile -> {
@@ -557,7 +594,7 @@ class JavaLanguageServer implements LanguageServer {
         }
     }
 
-    public static String getMvnCommand() {
+    private static String getMvnCommand() {
         String mvnCommand = "mvn";
         if (File.separatorChar == '\\') {
             mvnCommand = findExecutableOnPath("mvn.cmd");
@@ -568,7 +605,7 @@ class JavaLanguageServer implements LanguageServer {
         return mvnCommand;
     }
 
-    public static String findExecutableOnPath(String name) {
+    private static String findExecutableOnPath(String name) {
         for (String dirname : System.getenv("PATH").split(File.pathSeparator)) {
             File file = new File(dirname, name);
             if (file.isFile() && file.canExecute()) {
@@ -578,7 +615,7 @@ class JavaLanguageServer implements LanguageServer {
         return null;
     }
 
-    public static Set<Path> sourceDirectories(Path pomXml) {
+    private static Set<Path> sourceDirectories(Path pomXml) {
         try {
             Set<Path> all = new HashSet<>();
 
@@ -651,9 +688,9 @@ class JavaLanguageServer implements LanguageServer {
         }
     }
 
-    public JavaFileObject findFile(JavacHolder compiler, Path path) {
-        if (sourceByPath.containsKey(path))
-            return new StringFileObject(sourceByPath.get(path), path);
+    private JavaFileObject findFile(JavacHolder compiler, Path path) {
+        if (activeDocuments.containsKey(path))
+            return new StringFileObject(activeDocuments.get(path), path);
         else
             return compiler.fileManager.getRegularFile(path.toFile());
     }
@@ -715,9 +752,42 @@ class JavaLanguageServer implements LanguageServer {
         int character = params.getPosition().getCharacter();
         List<Location> result = new ArrayList<>();
 
-        findSymbol(uri, line, character).ifPresent(symbol -> {
-            getFilePath(uri).map(this::findIndex).ifPresent(index -> {
-                index.references(symbol).forEach(result::add);
+        getFilePath(uri).ifPresent(path -> {
+            JCTree.JCCompilationUnit compilationUnit = findTree(path);
+
+            findSymbol(compilationUnit, line, character).ifPresent(symbol -> {
+                if (SymbolIndex.shouldIndex(symbol)) {
+                    SymbolIndex index = findIndex(path);
+
+                    index.references(symbol).forEach(result::add);
+                }
+                else {
+                    compilationUnit.accept(new TreeScanner() {
+                        @Override
+                        public void visitSelect(JCTree.JCFieldAccess tree) {
+                            super.visitSelect(tree);
+
+                            if (tree.sym != null && tree.sym.equals(symbol))
+                                result.add(SymbolIndex.location(tree, compilationUnit));
+                        }
+
+                        @Override
+                        public void visitReference(JCTree.JCMemberReference tree) {
+                            super.visitReference(tree);
+
+                            if (tree.sym != null && tree.sym.equals(symbol))
+                                result.add(SymbolIndex.location(tree, compilationUnit));
+                        }
+
+                        @Override
+                        public void visitIdent(JCTree.JCIdent tree) {
+                            super.visitIdent(tree);
+
+                            if (tree.sym != null && tree.sym.equals(symbol))
+                                result.add(SymbolIndex.location(tree, compilationUnit));
+                        }
+                    });
+                }
             });
         });
 
@@ -735,21 +805,30 @@ class JavaLanguageServer implements LanguageServer {
         }).orElse(Collections.emptyList());
     }
 
-    public Optional<Symbol> findSymbol(URI uri, int line, int character) {
-        return getFilePath(uri).flatMap(path -> {
+    private JCTree.JCCompilationUnit findTree(Path path) {
+        JavacHolder compiler = findCompiler(path);
+        SymbolIndex index = findIndex(path);
+        JavaFileObject file = findFile(compiler, path);
+
+        compiler.onError(err -> {});
+
+        JCTree.JCCompilationUnit tree = compiler.parse(file);
+
+        compiler.compile(Collections.singleton(tree));
+
+        // TODO compiler should do this automatically
+        index.update(tree, compiler.context);
+
+        return tree;
+    }
+
+    public Optional<Symbol> findSymbol(JCTree.JCCompilationUnit tree, int line, int character) {
+        JavaFileObject file = tree.getSourceFile();
+
+        return getFilePath(file.toUri()).flatMap(path -> {
             JavacHolder compiler = findCompiler(path);
-            SymbolIndex index = findIndex(path);
-            JavaFileObject file = findFile(compiler, path);
             long cursor = findOffset(file, line, character);
             SymbolUnderCursorVisitor visitor = new SymbolUnderCursorVisitor(file, cursor, compiler.context);
-
-            compiler.onError(err -> {});
-
-            JCTree.JCCompilationUnit tree = compiler.parse(file);
-
-            compiler.compile(tree);
-
-            index.update(tree, compiler.context);
 
             tree.accept(visitor);
 
@@ -763,17 +842,32 @@ class JavaLanguageServer implements LanguageServer {
         int character = position.getPosition().getCharacter();
         List<Location> result = new ArrayList<>();
 
-        findSymbol(uri, line, character).ifPresent(symbol -> {
-            getFilePath(uri).map(this::findIndex).ifPresent(index -> {
-                index.findSymbol(symbol).ifPresent(info -> {
-                    result.add(info.getLocation());
-                });
+        getFilePath(uri).ifPresent(path -> {
+            JCTree.JCCompilationUnit compilationUnit = findTree(path);
+
+            findSymbol(compilationUnit, line, character).ifPresent(symbol -> {
+                if (SymbolIndex.shouldIndex(symbol)) {
+                    SymbolIndex index = findIndex(path);
+
+                    index.findSymbol(symbol).ifPresent(info -> {
+                        result.add(info.getLocation());
+                    });
+                }
+                else {
+                    JCTree symbolTree = TreeInfo.declarationFor(symbol, compilationUnit);
+
+                    if (symbolTree != null)
+                        result.add(SymbolIndex.location(symbolTree, compilationUnit));
+                }
             });
         });
 
         return result;
     }
 
+    /**
+     * Convert on offset-based range to a {@link io.typefox.lsapi.Range}
+     */
     public static RangeImpl findPosition(JavaFileObject file, long startOffset, long endOffset) {
         try (Reader in = file.openReader(true)) {
             long offset = 0;
@@ -839,7 +933,7 @@ class JavaLanguageServer implements LanguageServer {
         return p;
     }
 
-    public static long findOffset(JavaFileObject file, int targetLine, int targetCharacter) {
+    private static long findOffset(JavaFileObject file, int targetLine, int targetCharacter) {
         try (Reader in = file.openReader(true)) {
             long offset = 0;
             int line = 0;
@@ -875,23 +969,20 @@ class JavaLanguageServer implements LanguageServer {
         }
     }
     
-    public HoverImpl doHover(TextDocumentPositionParams position) {
+    private HoverImpl doHover(TextDocumentPositionParams position) {
         HoverImpl result = new HoverImpl();
         List<MarkedStringImpl> contents = new ArrayList<>();
 
         result.setContents(contents);
 
-        Optional<Path> maybePath = getFilePath(URI.create(position.getTextDocument().getUri()));
+        URI uri = URI.create(position.getTextDocument().getUri());
+        int line = position.getPosition().getLine();
+        int character = position.getPosition().getCharacter();
 
-        if (maybePath.isPresent()) {
-            Path path = maybePath.get();
-            Optional<Symbol> found = findSymbol(path.toUri(),
-                                                position.getPosition().getLine(),
-                                                position.getPosition().getCharacter()
-            );
-            if (found.isPresent()) {
-                Symbol symbol = found.get();
-                
+        getFilePath(uri).ifPresent(path -> {
+            JCTree.JCCompilationUnit compilationUnit = findTree(path);
+
+            findSymbol(compilationUnit, line, character).ifPresent(symbol -> {
                 switch (symbol.getKind()) {
                     case PACKAGE:
                         contents.add(markedString("package " + symbol.getQualifiedName()));
@@ -920,7 +1011,7 @@ class JavaLanguageServer implements LanguageServer {
                         Symbol.MethodSymbol method = (Symbol.MethodSymbol) symbol;
                         String signature = AutocompleteVisitor.methodSignature(method);
                         String returnType = ShortTypePrinter.print(method.getReturnType());
-                        
+
                         contents.add(markedString(returnType + " " + signature));
 
                         break;
@@ -937,9 +1028,9 @@ class JavaLanguageServer implements LanguageServer {
                     case RESOURCE_VARIABLE:
                         break;
                 }
-            }
-        }
-        
+            });
+        });
+
         return result;
     }
 
@@ -977,7 +1068,7 @@ class JavaLanguageServer implements LanguageServer {
             // There are often parse errors after the cursor, which can generate unrecoverable type errors
             ast.accept(new AutocompletePruner(withSemi, cursor, compiler.context));
 
-            compiler.compile(ast);
+            compiler.compile(Collections.singleton(ast));
 
             ast.accept(autocompleter);
 

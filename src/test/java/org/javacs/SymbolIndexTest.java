@@ -1,22 +1,16 @@
 package org.javacs;
 
 import com.sun.tools.javac.code.Symbol;
-import io.typefox.lsapi.*;
+
 import javax.tools.*;
 import com.sun.tools.javac.tree.*;
-import org.junit.Ignore;
 import org.junit.Test;
 
-import java.io.*;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import static org.hamcrest.Matchers.*;
 import static org.junit.Assert.assertThat;
@@ -96,20 +90,14 @@ public class SymbolIndexTest {
     }
 
     private Symbol symbol(String path, int line, int character) {
-        try {
-            URI uri = GetResourceFileObject.class.getResource(path).toURI();
-
-            return new JavaLanguageServer(compiler).findSymbol(uri, line, character).orElse(null);
-        } catch (URISyntaxException e) {
-            throw new RuntimeException(e);
-        }
+        return new JavaLanguageServer(compiler).findSymbol(compile(path), line, character).orElse(null);
     }
 
     private JCTree.JCCompilationUnit compile(String path) {
         JavaFileObject file = new GetResourceFileObject(path);
         JCTree.JCCompilationUnit tree = compiler.parse(file);
 
-        compiler.compile(tree);
+        compiler.compile(Collections.singleton(tree));
         index.update(tree, compiler.context);
 
         return tree;
@@ -125,9 +113,7 @@ public class SymbolIndexTest {
     private static SymbolIndex getIndex() {
         Set<Path> sourcePath = Collections.singleton(Paths.get("src/main/java").toAbsolutePath());
         Path outputDirectory = Paths.get("out").toAbsolutePath();
-        SymbolIndex index = new SymbolIndex(classPath, sourcePath, outputDirectory, (paths, errs) -> {
-            errs.getDiagnostics().forEach(d -> LOG.info(d.getMessage(Locale.US)));
-        });
+        SymbolIndex index = new SymbolIndex(classPath, sourcePath, outputDirectory);
 
         index.initialIndexComplete.join();
 
