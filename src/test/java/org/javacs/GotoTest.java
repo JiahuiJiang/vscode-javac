@@ -1,26 +1,25 @@
 package org.javacs;
 
-import io.typefox.lsapi.*;
-import io.typefox.lsapi.impl.*;
-import org.junit.Ignore;
-import org.junit.Test;
+import static org.hamcrest.Matchers.*;
+import static org.junit.Assert.assertThat;
 
 import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.nio.file.Paths;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.logging.Logger;
+import org.eclipse.lsp4j.*;
+import org.junit.Ignore;
+import org.junit.Test;
 
-import static org.hamcrest.Matchers.contains;
-import static org.hamcrest.Matchers.hasItems;
-import static org.hamcrest.Matchers.not;
-import static org.junit.Assert.assertThat;
-
-public class GotoTest extends Fixtures {
+public class GotoTest {
     private static final Logger LOG = Logger.getLogger("main");
     private static final String file = "/org/javacs/example/Goto.java";
-    private static final URI uri = uri(file);
+    private static final URI uri = FindResource.uri(file),
+            other = FindResource.uri("/org/javacs/example/GotoOther.java");
+    private static final String defaultConstructorFile =
+            "/org/javacs/example/GotoDefaultConstructor.java";
+    private static final URI defaultConstructorUri = FindResource.uri(defaultConstructorFile);
 
     @Test
     public void localVariable() throws IOException {
@@ -31,17 +30,16 @@ public class GotoTest extends Fixtures {
 
     @Test
     public void defaultConstructor() throws IOException {
-        List<? extends Location> suggestions = doGoto(file, 9, 20);
+        List<? extends Location> suggestions = doGoto(defaultConstructorFile, 4, 45);
 
-        assertThat(suggestions, contains(location(uri, 2, 13, 2, 17)));
+        assertThat(suggestions, contains(location(defaultConstructorUri, 2, 13, 2, 35)));
     }
 
     @Test
-    @Ignore // TODO
     public void constructor() throws IOException {
         List<? extends Location> suggestions = doGoto(file, 10, 20);
 
-        assertThat(suggestions, contains(location(uri, 29, 11, 29, 15)));
+        assertThat(suggestions, contains(location(uri, 43, 11, 43, 15)));
     }
 
     @Test
@@ -94,6 +92,29 @@ public class GotoTest extends Fixtures {
     }
 
     @Test
+    public void otherStaticMethod() throws IOException {
+        List<? extends Location> suggestions = doGoto(file, 28, 24);
+
+        assertThat(suggestions, contains(hasProperty("uri", equalTo(other.toString()))));
+    }
+
+    @Test
+    public void otherMethod() throws IOException {
+        List<? extends Location> suggestions = doGoto(file, 29, 17);
+
+        assertThat(suggestions, contains(hasProperty("uri", equalTo(other.toString()))));
+    }
+
+    @Test
+    public void otherCompiledFile() throws IOException {
+        server.compile(other);
+
+        List<? extends Location> suggestions = doGoto(file, 28, 24);
+
+        assertThat(suggestions, contains(hasProperty("uri", equalTo(other.toString()))));
+    }
+
+    @Test
     @Ignore // TODO
     public void typeParam() throws IOException {
         List<? extends Location> suggestions = doGoto(file, 45, 11);
@@ -101,23 +122,31 @@ public class GotoTest extends Fixtures {
         assertThat(suggestions, contains(location(uri, 2, 18, 2, 23)));
     }
 
-    private LocationImpl location(URI uri, int startRow, int startColumn, int endRow, int endColumn) {
-        PositionImpl start = new PositionImpl();
+    @Test
+    public void gotoEnum() throws IOException {
+        String file = "/org/javacs/example/GotoEnum.java";
+
+        assertThat(doGoto(file, 5, 30), not(empty()));
+        assertThat(doGoto(file, 5, 35), not(empty()));
+    }
+
+    private Location location(URI uri, int startRow, int startColumn, int endRow, int endColumn) {
+        Position start = new Position();
 
         start.setLine(startRow);
         start.setCharacter(startColumn);
 
-        PositionImpl end = new PositionImpl();
+        Position end = new Position();
 
         end.setLine(startRow);
         end.setCharacter(endColumn);
 
-        RangeImpl range = new RangeImpl();
+        Range range = new Range();
 
         range.setStart(start);
         range.setEnd(end);
 
-        LocationImpl location = new LocationImpl();
+        Location location = new Location();
 
         location.setUri(uri.toString());
         location.setRange(range);
@@ -125,30 +154,26 @@ public class GotoTest extends Fixtures {
         return location;
     }
 
+    private static final JavaLanguageServer server = LanguageServerFixture.getJavaLanguageServer();
+
     private List<? extends Location> doGoto(String file, int row, int column) throws IOException {
-        TextDocumentIdentifierImpl document = new TextDocumentIdentifierImpl();
+        TextDocumentIdentifier document = new TextDocumentIdentifier();
 
-        document.setUri(uri(file).toString());
+        document.setUri(FindResource.uri(file).toString());
 
-        PositionImpl position = new PositionImpl();
+        Position position = new Position();
 
         position.setLine(row);
         position.setCharacter(column);
 
-        TextDocumentPositionParamsImpl p = new TextDocumentPositionParamsImpl();
+        TextDocumentPositionParams p = new TextDocumentPositionParams();
 
         p.setTextDocument(document);
         p.setPosition(position);
 
-        JavaLanguageServer server = Fixtures.getJavaLanguageServer();
-
-        return server.gotoDefinition(p);
-    }
-
-    private static URI uri(String file) {
         try {
-            return GotoTest.class.getResource(file).toURI();
-        } catch (URISyntaxException e) {
+            return server.getTextDocumentService().definition(p).get();
+        } catch (InterruptedException | ExecutionException e) {
             throw new RuntimeException(e);
         }
     }
