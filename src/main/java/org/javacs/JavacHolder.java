@@ -2,141 +2,270 @@ package org.javacs;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
+import com.sun.source.tree.CompilationUnitTree;
+import com.sun.source.util.JavacTask;
 import com.sun.source.util.TaskEvent;
 import com.sun.source.util.TaskListener;
-import com.sun.tools.javac.api.JavacTrees;
-import com.sun.tools.javac.api.MultiTaskListener;
-import com.sun.tools.javac.code.Type;
-import com.sun.tools.javac.code.Types;
-import com.sun.tools.javac.comp.*;
+import com.sun.source.util.TreePath;
+import com.sun.tools.javac.api.JavacTaskImpl;
+import com.sun.tools.javac.api.JavacTool;
 import com.sun.tools.javac.file.JavacFileManager;
 import com.sun.tools.javac.main.JavaCompiler;
-import com.sun.tools.javac.parser.FuzzyParserFactory;
-import com.sun.tools.javac.tree.JCTree;
-import com.sun.tools.javac.tree.TreeScanner;
-import com.sun.tools.javac.util.*;
-
-import javax.tools.*;
+import com.sun.tools.javac.util.Options;
 import java.io.*;
-import java.lang.reflect.Field;
+import java.net.URI;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.FileTime;
+import java.nio.file.Paths;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import javax.lang.model.element.Element;
+import javax.tools.*;
 
 /**
- * Maintains a reference to a Java compiler, 
- * and several of its internal data structures,
- * which we need to fiddle with to get incremental compilation 
- * and extract the diagnostic information we want.
+ * Maintains a reference to a Java compiler, and several of its internal data structures, which we
+ * need to fiddle with to get incremental compilation and extract the diagnostic information we
+ * want.
  */
 public class JavacHolder {
+
+    public static JavacHolder create(Set<Path> sourcePath, Set<Path> classPath) {
+        return new JavacHolder(sourcePath, classPath);
+    }
+
+    /**
+     * Compile a single file, without updating the index.
+     *
+     * <p>As an optimization, this function may ignore code not accessible to the cursor.
+     */
+    public FocusedResult compileFocused(
+            URI file, Optional<String> textContent, int line, int column, boolean pruneStatements) {
+        JavaFileObject fileObject = findFile(file, textContent);
+
+        if (pruneStatements)
+            fileObject = TreePruner.putSemicolonAfterCursor(fileObject, line, column);
+
+        JavacTask task = createTask(Collections.singleton(fileObject), true);
+        TreePruner pruner = new TreePruner(task);
+
+        // Record timing
+        EnumMap<TaskEvent.Kind, Map<URI, Profile>> profile = new EnumMap<>(TaskEvent.Kind.class);
+
+        task.addTaskListener(
+                new TaskListener() {
+                    @Override
+                    public void started(TaskEvent e) {
+                        if (e.getSourceFile() == null) return;
+
+                        profile.computeIfAbsent(e.getKind(), newKind -> new HashMap<>())
+                                .put(e.getSourceFile().toUri(), new Profile());
+                    }
+
+                    @Override
+                    public void finished(TaskEvent e) {
+                        if (e.getSourceFile() == null) return;
+
+                        if (e.getKind() == TaskEvent.Kind.PARSE) {
+                            boolean isCursorInFile =
+                                    e.getCompilationUnit().getSourceFile().toUri().equals(file);
+
+                            if (isCursorInFile) {
+                                pruner.removeNonCursorMethodBodies(
+                                        e.getCompilationUnit(), line, column);
+
+                                if (pruneStatements)
+                                    pruner.removeStatementsAfterCursor(
+                                            e.getCompilationUnit(), line, column);
+                            } else {
+                                pruner.removeAllMethodBodies(e.getCompilationUnit());
+                            }
+                        }
+
+                        profile.get(e.getKind()).get(e.getSourceFile().toUri()).finished =
+                                Optional.of(Instant.now());
+                    }
+                });
+
+        try {
+            Iterable<? extends CompilationUnitTree> parse = task.parse();
+            CompilationUnitTree compilationUnit = parse.iterator().next();
+
+            try {
+                Iterable<? extends Element> analyze = task.analyze();
+            } catch (AssertionError e) {
+                if (!catchJavacError(e)) throw e;
+            }
+
+            // Log timing
+            profile.forEach(
+                    (kind, timed) -> {
+                        long elapsed =
+                                timed.values()
+                                        .stream()
+                                        .mapToLong(p -> p.elapsed().toMillis())
+                                        .sum();
+
+                        if (timed.size() > 5) {
+                            LOG.info(
+                                    String.format(
+                                            "%s\t%d ms\t%d files",
+                                            kind.name(), elapsed, timed.size()));
+                        } else {
+                            String names =
+                                    timed.keySet()
+                                            .stream()
+                                            .map(uri -> Paths.get(uri).getFileName().toString())
+                                            .collect(Collectors.joining(", "));
+
+                            LOG.info(String.format("%s\t%d ms\t%s", kind.name(), elapsed, names));
+                        }
+                    });
+
+            Optional<TreePath> cursor = FindCursor.find(task, compilationUnit, line, column);
+
+            return new FocusedResult(compilationUnit, cursor, task, classPathIndex);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Clear files and all their dependents, recompile, compileBatch the index, and report any
+     * errors.
+     *
+     * <p>If these files reference un-compiled dependencies, those dependencies will also be parsed
+     * and compiled.
+     */
+    public DiagnosticCollector<JavaFileObject> compileBatch(Map<URI, Optional<String>> files) {
+        return compileBatch(files, (task, tree) -> {});
+    }
+
+    public DiagnosticCollector<JavaFileObject> compileBatch(
+            Map<URI, Optional<String>> files, BiConsumer<JavacTask, CompilationUnitTree> listener) {
+        return doCompile(files, listener);
+    }
+
     private static final Logger LOG = Logger.getLogger("main");
     /** Where this javac looks for library .class files */
     public final Set<Path> classPath;
     /** Where this javac looks for .java source files */
     public final Set<Path> sourcePath;
-    /** Where this javac places generated .class files */
-    public final Path outputDirectory;
-    // javac places all of its internal state into this Context object,
-    // which is basically a Map<String, Object>
-    public final Context context = new Context();
-    // Error reporting initially goes nowhere
-    // When we want to report errors back to VS Code, we'll replace this with something else
-    private DiagnosticListener<JavaFileObject> errorsDelegate = diagnostic -> {};
-    // javac isn't friendly to swapping out the error-reporting DiagnosticListener,
-    // so we install this intermediate DiagnosticListener, which forwards to errorsDelegate
-    private final DiagnosticListener<JavaFileObject> errors = diagnostic -> {
-        errorsDelegate.report(diagnostic);
-    };
-    
-    {
-        context.put(DiagnosticListener.class, errors);
-    }
-    
-    // Sets command-line options
-    private final Options options = Options.instance(context);
-    
-    {
-        // You would think we could do -Xlint:all, 
-        // but some lints trigger fatal errors in the presence of parse errors
-        options.put("-Xlint:cast", "");
-        options.put("-Xlint:deprecation", "");
-        options.put("-Xlint:empty", "");
-        options.put("-Xlint:fallthrough", "");
-        options.put("-Xlint:finally", "");
-        options.put("-Xlint:path", "");
-        options.put("-Xlint:unchecked", "");
-        options.put("-Xlint:varargs", "");
-        options.put("-Xlint:static", "");
-    }
 
-    // Pre-register some custom components before javac initializes
-    
-    private final Log log = Log.instance(context);
-
-    {
-        log.multipleErrors = true;
-    }
-
-    public final JavacFileManager fileManager = new JavacFileManager(context, true, null);
-    private final ForgivingAttr attr = ForgivingAttr.instance(context);
-    private final Check check = Check.instance(context);
-    private final FuzzyParserFactory parserFactory = FuzzyParserFactory.instance(context);
-    
-    // Initialize javac
-
-    public final JavaCompiler compiler = JavaCompiler.instance(context);
-
-    {
-        // We're going to use the javadoc comments
-        compiler.keepComments = true;
-    }
-
-    // javac has already been initialized, fetch a few components for easy access
-
-    private final Todo todo = Todo.instance(context);
-    private final JavacTrees trees = JavacTrees.instance(context);
-    private final Types types = Types.instance(context);
-
-    public JavacHolder(Set<Path> classPath, Set<Path> sourcePath, Path outputDirectory) {
-        this.classPath = Collections.unmodifiableSet(classPath);
-        this.sourcePath = Collections.unmodifiableSet(sourcePath);
-        this.outputDirectory = outputDirectory;
-
-        options.put("-classpath", Joiner.on(File.pathSeparator).join(classPath));
-        options.put("-sourcepath", Joiner.on(File.pathSeparator).join(sourcePath));
-        options.put("-d", outputDirectory.toString());
-
-        MultiTaskListener.instance(context).add(new TaskListener() {
-            @Override
-            public void started(TaskEvent e) {
-                LOG.fine("started " + e);
-
-                JCTree.JCCompilationUnit unit = (JCTree.JCCompilationUnit) e.getCompilationUnit();
-            }
-
-            @Override
-            public void finished(TaskEvent e) {
-                LOG.fine("finished " + e);
-
-                JCTree.JCCompilationUnit unit = (JCTree.JCCompilationUnit) e.getCompilationUnit();
-            }
-        });
-
-        ensureOutputDirectory(outputDirectory);
-        clearOutputDirectory(outputDirectory);
-    }
-
-    /** 
-     * Ensure output directory exists 
+    /**
+     * Javac tool creates a new Context every time we do createTask(...), so maintaining a reference
+     * to it doesn't really do anything
      */
+    private final JavacTool javac = JavacTool.create();
+
+    /*
+     * JavacFileManager caches classpath internally, so both fileManager and incrementalFileManager will have the same classPath
+     */
+
+    /** Direct file manager we use to obtain reference to file we are re-compiling */
+    private final JavacFileManager fileManager =
+            javac.getStandardFileManager(this::onError, null, Charset.defaultCharset());
+
+    /** File manager that hides .java files that have up-to-date sources */
+    private final JavaFileManager incrementalFileManager = new IncrementalFileManager(fileManager);
+
+    /**
+     * javac isn't friendly to swapping out the error-reporting DiagnosticListener, so we install
+     * this intermediate DiagnosticListener, which forwards to errorsDelegate
+     */
+    private void onError(Diagnostic<? extends JavaFileObject> diagnostic) {
+        onErrorDelegate.report(diagnostic);
+    }
+
+    /**
+     * Error reporting initially goes nowhere. We will replace this with a function that collects
+     * errors so we can report all the errors associated with a file apply once.
+     */
+    private DiagnosticListener<JavaFileObject> onErrorDelegate = diagnostic -> {};
+
+    /** Forward javac logging to file */
+    private Writer logDelegate = createLogDelegate();
+
+    private static Writer createLogDelegate() {
+        try {
+            Path output = Files.createTempFile("javac", ".log");
+            BufferedWriter out = Files.newBufferedWriter(output);
+
+            LOG.info("Forwarding javac log to " + output);
+
+            return out;
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public final ClassPathIndex classPathIndex;
+
+    private JavacHolder(Set<Path> sourcePath, Set<Path> classPath) {
+        this.sourcePath = Collections.unmodifiableSet(sourcePath);
+        this.classPath = Collections.unmodifiableSet(classPath);
+        this.classPathIndex = new ClassPathIndex(classPath);
+    }
+
+    static List<String> options(Set<Path> sourcePath, Set<Path> classPath) {
+        return ImmutableList.of(
+                "-classpath",
+                Joiner.on(File.pathSeparator).join(classPath),
+                "-sourcepath",
+                Joiner.on(File.pathSeparator).join(sourcePath),
+                "-verbose",
+                // You would think we could do -Xlint:all,
+                // but some lints trigger fatal errors in the presence of parse errors
+                "-Xlint:cast",
+                "-Xlint:deprecation",
+                "-Xlint:empty",
+                "-Xlint:fallthrough",
+                "-Xlint:finally",
+                "-Xlint:path",
+                "-Xlint:unchecked",
+                "-Xlint:varargs",
+                "-Xlint:static");
+    }
+
+    private static class Profile {
+        Instant started = Instant.now();
+        Optional<Instant> finished = Optional.empty();
+
+        Duration elapsed() {
+            return Duration.between(started, finished.orElse(started));
+        }
+    }
+
+    private JavacTask createTask(Collection<JavaFileObject> files, boolean incremental) {
+        JavacTask result =
+                javac.getTask(
+                        logDelegate,
+                        incrementalFileManager,
+                        this::onError,
+                        options(sourcePath, classPath),
+                        null,
+                        files);
+        JavacTaskImpl impl = (JavacTaskImpl) result;
+
+        // Better stack traces inside javac
+        Options options = Options.instance(impl.getContext());
+
+        options.put("dev", "");
+
+        // Skip annotation processing
+        JavaCompiler compiler = JavaCompiler.instance(impl.getContext());
+
+        compiler.skipAnnotationProcessing = true;
+
+        return result;
+    }
+
+    /** Ensure output directory exists */
     private void ensureOutputDirectory(Path dir) {
         if (!Files.exists(dir)) {
             try {
@@ -144,131 +273,77 @@ public class JavacHolder {
             } catch (IOException e) {
                 throw ShowMessageException.error("Error created output directory " + dir, null);
             }
-        }
-        else if (!Files.isDirectory(dir))
-            throw ShowMessageException.error("Output directory " + dir + " is not a directory", null);
+        } else if (!Files.isDirectory(dir))
+            throw ShowMessageException.error(
+                    "Output directory " + dir + " is not a directory", null);
     }
 
-    /** 
-     * Set all .class files to modified-at 1970 so javac won't skip them when we invoke it 
-     */
-    private static void clearOutputDirectory(Path file) {
+    // TODO this should return Optional.empty() file URI is not file: and text is empty
+    private JavaFileObject findFile(URI file, Optional<String> text) {
+        return text.map(content -> (JavaFileObject) new StringFileObject(content, file))
+                .orElseGet(() -> fileManager.getRegularFile(Paths.get(file).toFile()));
+    }
+
+    private DiagnosticCollector<JavaFileObject> startCollectingErrors() {
+        DiagnosticCollector<JavaFileObject> errors = new DiagnosticCollector<>();
+
+        onErrorDelegate =
+                error -> {
+                    if (error.getStartPosition() != Diagnostic.NOPOS) errors.report(error);
+                    else LOG.warning("Skipped " + error.getMessage(null));
+                };
+        return errors;
+    }
+
+    private void stopCollectingErrors() {
+        onErrorDelegate = error -> {};
+    }
+
+    private DiagnosticCollector<JavaFileObject> doCompile(
+            Map<URI, Optional<String>> files, BiConsumer<JavacTask, CompilationUnitTree> forEach) {
+        // TODO remove all URIs from fileManager
+
+        List<JavaFileObject> objects =
+                files.entrySet()
+                        .stream()
+                        .map(e -> findFile(e.getKey(), e.getValue()))
+                        .collect(Collectors.toList());
+
+        JavacTask task = createTask(objects, false);
+
         try {
-            if (file.getFileName().toString().endsWith(".class")) {
-                LOG.info("Invalidate " + file);
+            DiagnosticCollector<JavaFileObject> errors = startCollectingErrors();
+            Iterable<? extends CompilationUnitTree> parse = task.parse();
 
-                Files.setLastModifiedTime(file, FileTime.from(Instant.EPOCH));
-            }
-            else if (Files.isDirectory(file))
-                Files.list(file).forEach(JavacHolder::clearOutputDirectory);
-        } catch (IOException e) {
-            LOG.log(Level.SEVERE, e.getMessage(), e);
-        }
-    }
-
-    /**
-     * Send all errors to callback, replacing any existing callback
-     */
-    public void onError(DiagnosticListener<JavaFileObject> callback) {
-        errorsDelegate = callback;
-    }
-
-    /**
-     * Compile the indicated source file, and its dependencies if they have been modified.
-     */
-    public JCTree.JCCompilationUnit parse(JavaFileObject source) {
-        clear(source);
-
-        JCTree.JCCompilationUnit result = compiler.parse(source);
-
-        return result;
-    }
-
-    /**
-     * Compile a set of parsed files.
-     * 
-     * If these files reference un-parsed dependencies, those dependencies will also be parsed and compiled.
-     */
-    public void compile(Collection<JCTree.JCCompilationUnit> parsed) {
-        compiler.processAnnotations(compiler.enterTrees(com.sun.tools.javac.util.List.from(parsed)));
-
-        while (!todo.isEmpty()) {
-            Env<AttrContext> next = todo.remove();
+            // TODO minimize memory use during this process
+            // Instead of doing parse-all / compileFileObjects-all,
+            // queue all files, then do parse / compileFileObjects on each
+            // If invoked correctly, javac should avoid reparsing the same file twice
+            // Then, use the same mechanism as the desugar / generate phases to remove method bodies,
+            // to reclaim memory as we go
 
             try {
-                // We don't do the desugar or generate phases, because they remove method bodies and methods
-                Env<AttrContext> attributedTree = compiler.attribute(next);
-                Queue<Env<AttrContext>> analyzedTree = compiler.flow(attributedTree);
-            } catch (Exception e) {
-                LOG.log(Level.SEVERE, "Error compiling " + next.toplevel.sourcefile.getName(), e);
-
-                // Keep going
+                Iterable<? extends Element> analyze = task.analyze();
+            } catch (AssertionError e) {
+                if (!catchJavacError(e)) throw e;
             }
-        }
-    }
 
-    /**
-     * Clear a file from javac's internal caches
-     */
-    public void clear(JavaFileObject source) {
-        // TODO clear dependencies as well (dependencies should get stored in SymbolIndex)
+            parse.forEach(tree -> forEach.accept(task, tree));
 
-        // Forget about this file
-        Consumer<JavaFileObject> removeFromLog = logRemover(log);
-
-        removeFromLog.accept(source);
-
-        // javac's flow stage will stop early if there are errors
-        log.nerrors = 0;
-        log.nwarnings = 0;
-
-        // Remove all cached classes that came from this files
-        List<Name> remove = new ArrayList<>();
-
-        Consumer<Type> removeFromClosureCache = closureCacheRemover(types);
-
-        check.compiled.forEach((name, symbol) -> {
-            if (symbol.sourcefile.getName().equals(source.getName()))
-                remove.add(name);
-
-            removeFromClosureCache.accept(symbol.type);
-        });
-
-        remove.forEach(check.compiled::remove);
-
-    }
-
-    /** 
-     * Reflectively invokes Types.closureCache.remove(Type) 
-     */
-    private static Consumer<Type> closureCacheRemover(Types types) {
-        try {
-            Field closureCache = Types.class.getDeclaredField("closureCache");
-
-            closureCache.setAccessible(true);
-
-            Map<Type, com.sun.tools.javac.util.List<Type>> value = (Map<Type, com.sun.tools.javac.util.List<Type>>) closureCache.get(types);
-
-            return value::remove;
-        } catch (IllegalAccessException | NoSuchFieldException e) {
+            return errors;
+        } catch (IOException e) {
             throw new RuntimeException(e);
+        } finally {
+            stopCollectingErrors();
         }
     }
 
-    /** 
-     * Reflectively invokes Log.sourceMap.remove(JavaFileObject) 
-     */
-    private static Consumer<JavaFileObject> logRemover(Log log) {
-        try {
-            Field sourceMap = AbstractLog.class.getDeclaredField("sourceMap");
+    private boolean catchJavacError(AssertionError e) {
+        if (e.getStackTrace().length > 0
+                && e.getStackTrace()[0].getClassName().startsWith("com.sun.tools.javac")) {
+            LOG.log(Level.WARNING, "Failed analyze phase", e);
 
-            sourceMap.setAccessible(true);
-
-            Map<JavaFileObject, DiagnosticSource> value = (Map<JavaFileObject, DiagnosticSource>) sourceMap.get(log);
-
-            return value::remove;
-        } catch (IllegalAccessException | NoSuchFieldException e) {
-            throw new RuntimeException(e);
-        }
+            return true;
+        } else return false;
     }
 }

@@ -1,374 +1,465 @@
 package org.javacs;
 
+import com.google.common.collect.Maps;
+import com.sun.source.tree.*;
+import com.sun.source.util.*;
+import com.sun.tools.javac.api.JavacTool;
+import com.sun.tools.javac.file.JavacFileManager;
+import java.io.File;
+import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
 import java.util.*;
-import java.io.*;
-import java.nio.file.*;
-import java.util.logging.*;
-import java.util.concurrent.*;
-import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
+import java.util.logging.Logger;
 import java.util.stream.Stream;
-import javax.lang.model.element.ElementKind;
-import javax.tools.*;
-
+import javax.lang.model.element.*;
+import javax.tools.Diagnostic;
 import javax.tools.JavaFileObject;
-
-import com.sun.tools.javac.tree.*;
-import com.sun.tools.javac.code.*;
-import com.sun.tools.javac.util.Context;
-import com.sun.tools.javac.util.Name;
-import io.typefox.lsapi.*;
-import io.typefox.lsapi.impl.*;
+import org.eclipse.lsp4j.*;
 
 /**
- * Global index of exported symbol declarations and references.
- * such as classes, methods, and fields.
+ * Global index of exported symbol declarations and references. such as classes, methods, and
+ * fields.
  */
-public class SymbolIndex {
-    private static final Logger LOG = Logger.getLogger("main");
+class SymbolIndex {
 
-    /**
-     * Completes when initial index is done. Useful for testing.
-     */
-    public final CompletableFuture<Void> initialIndexComplete = new CompletableFuture<>();
+    private final Path workspaceRoot;
+    private final Supplier<Collection<URI>> openFiles;
+    private final Function<URI, Optional<String>> activeContent;
+    private final JavacTool parser = JavacTool.create();
+    private final JavacFileManager emptyFileManager =
+            parser.getStandardFileManager(__ -> {}, null, Charset.defaultCharset());
 
-    /**
-     * Contains all symbol declarations and referencs in a single source file 
-     */
-    private static class SourceFileIndex {
-        private final EnumMap<ElementKind, Map<String, SymbolInformation>> declarations = new EnumMap<>(ElementKind.class);
-        private final EnumMap<ElementKind, Map<String, Set<Location>>> references = new EnumMap<>(ElementKind.class);
+    /** Source path files, for which we support methods and classes */
+    private final Map<URI, SourceFileIndex> sourcePathFiles = new ConcurrentHashMap<>();
+
+    private final CompletableFuture<?> finishedInitialIndex = new CompletableFuture<>();
+
+    SymbolIndex(
+            Path workspaceRoot,
+            Supplier<Collection<URI>> openFiles,
+            Function<URI, Optional<String>> activeContent) {
+        this.workspaceRoot = workspaceRoot;
+        this.openFiles = openFiles;
+        this.activeContent = activeContent;
+
+        new Thread(this::initialIndex, "Initial-Index").start();
     }
 
-    /**
-     * Source path files, for which we support methods and classes
-     */
-    private Map<URI, SourceFileIndex> sourcePath = new HashMap<>();
-    
-    public SymbolIndex(Set<Path> classPath, 
-                       Set<Path> sourcePath, 
-                       Path outputDirectory) {
-        JavacHolder compiler = new JavacHolder(classPath, sourcePath, outputDirectory);
-        Indexer indexer = new Indexer(compiler.context);
+    private void initialIndex() {
+        // TODO send a progress bar to the user
+        updateIndex(InferConfig.allJavaFiles(workspaceRoot).map(Path::toUri));
 
-        // Index exported declarations and references for all files on the source path
-        // This may take a while, so we'll do it on an extra thread
-        Thread worker = new Thread("InitialIndex") {
-            List<JCTree.JCCompilationUnit> parsed = new ArrayList<>();
-            List<Path> paths = new ArrayList<>();
+        finishedInitialIndex.complete(null);
+    }
+
+    private void updateIndex(Stream<URI> files) {
+        files.forEach(this::updateFile);
+    }
+
+    private void updateFile(URI each) {
+        if (needsUpdate(each)) {
+            CompilationUnitTree tree = parse(each);
+
+            update(tree);
+        }
+    }
+
+    private boolean needsUpdate(URI file) {
+        if (!sourcePathFiles.containsKey(file)) return true;
+        else {
+            try {
+                Instant updated = sourcePathFiles.get(file).updated;
+                Instant modified = Files.getLastModifiedTime(Paths.get(file)).toInstant();
+
+                return updated.isBefore(modified);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private final Map<URI, String> warnedPackageDirectoryConflict = new HashMap<>();
+
+    /**
+     * Guess the source path by looking at package declarations in .java files.
+     *
+     * <p>For example, if the file src/com/example/Test.java has the package declaration `package
+     * com.example;` then the source root is `src`.
+     */
+    Set<Path> sourcePath() {
+        updateOpenFiles();
+
+        Set<Path> result = new HashSet<>();
+
+        sourcePathFiles.forEach(
+                (uri, index) -> {
+                    Path dir = Paths.get(uri).getParent();
+                    String packagePath = index.packageName.replace('.', File.separatorChar);
+
+                    if (!dir.endsWith(packagePath)
+                            && !warnedPackageDirectoryConflict
+                                    .getOrDefault(uri, "?")
+                                    .equals(packagePath)) {
+                        LOG.warning("Java source file " + uri + " is not in " + packagePath);
+
+                        warnedPackageDirectoryConflict.put(uri, packagePath);
+                    } else {
+                        int up = Paths.get(packagePath).getNameCount();
+                        Path truncate = dir;
+
+                        for (int i = 0; i < up; i++) truncate = truncate.getParent();
+
+                        result.add(truncate);
+                    }
+                });
+
+        return result;
+    }
+
+    /** Search all indexed symbols */
+    Stream<SymbolInformation> search(String query) {
+        updateOpenFiles();
+
+        Predicate<CharSequence> nameMatchesQuery =
+                name -> Completions.containsCharactersInOrder(name, query, true);
+        Predicate<URI> fileMatchesQuery =
+                uri -> sourcePathFiles.get(uri).declarations.stream().anyMatch(nameMatchesQuery);
+        Collection<URI> open = openFiles.get();
+        Stream<URI> openFirst =
+                Stream.concat(
+                        open.stream(),
+                        sourcePathFiles.keySet().stream().filter(uri -> !open.contains(uri)));
+
+        return openFirst
+                .filter(fileMatchesQuery)
+                .flatMap(this::allInFile)
+                .filter(info -> nameMatchesQuery.test(info.getName()));
+    }
+
+    void updateOpenFiles() {
+        finishedInitialIndex.join();
+
+        updateIndex(openFiles.get().stream());
+    }
+
+    /** Get all declarations in an open file */
+    Stream<SymbolInformation> allInFile(URI source) {
+        LOG.info("Search " + source);
+
+        JavacTask task = parseTask(source);
+        Trees trees = Trees.instance(task);
+
+        class FindDeclarations extends TreePathScanner<Void, Void> {
+            List<SymbolInformation> result = new ArrayList<>();
+            Optional<ClassTree> currentClass = Optional.empty();
 
             @Override
-            public void run() {
-                // Parse each file
-                sourcePath.forEach(s -> parseAll(s, parsed, paths));
+            public Void visitClass(ClassTree node, Void aVoid) {
+                String name = node.getSimpleName().toString();
+                SymbolInformation info = new SymbolInformation();
 
-                // Compile all parsed files
-                compiler.compile(parsed);
+                info.setContainerName(packageName());
+                info.setKind(SymbolKind.Class);
+                info.setName(name);
+                findTreeName(name, getCurrentPath(), trees).ifPresent(info::setLocation);
 
-                parsed.forEach(p -> p.accept(indexer));
-                
-                // TODO minimize memory use during this process
-                // Instead of doing parse-all / compile-all, 
-                // queue all files, then do parse / compile on each
-                // If invoked correctly, javac should avoid reparsing the same file twice
-                // Then, use the same mechanism as the desugar / generate phases to remove method bodies, 
-                // to reclaim memory as we go
+                result.add(info);
 
-                initialIndexComplete.complete(null);
-                
-                // TODO verify that compiler and all its resources get destroyed
+                // Push current class and continue
+                Optional<ClassTree> previousClass = currentClass;
+
+                currentClass = Optional.of(node);
+                super.visitClass(node, aVoid);
+                currentClass = previousClass;
+
+                return null;
             }
 
-            /**
-             * Look for .java files and invalidate them
-             */
-            private void parseAll(Path path, List<JCTree.JCCompilationUnit> trees, List<Path> paths) {
-                if (Files.isDirectory(path)) try {
-                    Files.list(path).forEach(p -> parseAll(p, trees, paths));
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
+            @Override
+            public Void visitMethod(MethodTree node, Void aVoid) {
+                boolean constructor = node.getName().contentEquals("<init>");
+                String name =
+                        constructor
+                                ? currentClass.get().getSimpleName().toString()
+                                : node.getName().toString();
+                SymbolInformation info = new SymbolInformation();
+
+                info.setContainerName(qualifiedClassName());
+                info.setKind(constructor ? SymbolKind.Constructor : SymbolKind.Method);
+                info.setName(name);
+                findTreeName(name, getCurrentPath(), trees).ifPresent(info::setLocation);
+
+                result.add(info);
+
+                return super.visitMethod(node, aVoid);
+            }
+
+            @Override
+            public Void visitVariable(VariableTree node, Void aVoid) {
+                // If this is a field
+                if (getCurrentPath().getParentPath().getLeaf().getKind() == Tree.Kind.CLASS) {
+                    String name = node.getName().toString();
+                    SymbolInformation info = new SymbolInformation();
+
+                    info.setContainerName(qualifiedClassName());
+                    info.setName(name);
+                    info.setKind(SymbolKind.Property);
+                    findTreeName(name, getCurrentPath(), trees).ifPresent(info::setLocation);
+
+                    result.add(info);
                 }
-                else if (path.getFileName().toString().endsWith(".java")) {
-                    LOG.info("Index " + path);
 
-                    JavaFileObject file = compiler.fileManager.getRegularFile(path.toFile());
-
-                    trees.add(compiler.parse(file));
-                    paths.add(path);
-                }
+                return super.visitVariable(node, aVoid);
             }
-        };
 
-        worker.start();
-    }
+            private String qualifiedClassName() {
+                String packageName = packageName();
+                String className = currentClass.get().getSimpleName().toString();
 
-    /**
-     * Search all indexed symbols
-     */
-    public Stream<? extends SymbolInformation> search(String query) {
-        Stream<SymbolInformation> classes = allSymbols(ElementKind.CLASS);
-        Stream<SymbolInformation> methods = allSymbols(ElementKind.METHOD);
-
-        return Stream.concat(classes, methods)
-                     .filter(s -> containsCharsInOrder(s.getName(), query));
-    }
-
-    /**
-     * Get all symbols in an open file
-     */
-    public Stream<? extends SymbolInformation> allInFile(URI source) { 
-        SourceFileIndex index = sourcePath.getOrDefault(source, new SourceFileIndex());
-        
-        return index.declarations.values().stream().flatMap(map -> map.values().stream());
-    }
-
-    private Stream<SymbolInformation> allSymbols(ElementKind kind) {
-        return sourcePath.values().stream().flatMap(f -> allSymbolsInFile(f, kind));
-    }
-
-    private Stream<SymbolInformation> allSymbolsInFile(SourceFileIndex f, ElementKind kind) {
-        return f.declarations.getOrDefault(kind, Collections.emptyMap())
-                             .values()
-                             .stream();
-    }
-
-    /**
-     * Find all references to a symbol
-     */
-    public Stream<? extends Location> references(Symbol symbol) {
-        String key = uniqueName(symbol);
-
-        return sourcePath.values().stream().flatMap(f -> {
-            Map<String, Set<Location>> bySymbol = f.references.getOrDefault(symbol.getKind(), Collections.emptyMap());
-            Set<Location> locations = bySymbol.getOrDefault(key, Collections.emptySet());
-
-            return locations.stream();
-        });
-    }
-
-    public Optional<SymbolInformation> findSymbol(Symbol symbol) {
-        ElementKind kind = symbol.getKind();
-        String key = uniqueName(symbol);
-
-        for (SourceFileIndex f : sourcePath.values()) {
-            Map<String, SymbolInformation> withKind = f.declarations.getOrDefault(kind, Collections.emptyMap());
-
-            if (withKind.containsKey(key))
-                return Optional.of(withKind.get(key));
-        }
-
-        return Optional.empty();
-    }
-
-    /**
-     * Check if name contains all the characters of query in order.
-     * For example, name 'FooBar' contains query 'FB', but not 'BF'
-     */
-    private boolean containsCharsInOrder(String name, String query) {
-        int iName = 0, iQuery = 0;
-
-        while (iName < name.length() && iQuery < query.length()) {
-            // If query matches name, consume a character of query and of name
-            if (name.charAt(iName) == query.charAt(iQuery)) {
-                iName++;
-                iQuery++;
+                return packageName.isEmpty() ? className : packageName + "." + className;
             }
-            // Otherwise consume a character of name
-            else {
-                iName++;
+
+            private String packageName() {
+                return Objects.toString(getCurrentPath().getCompilationUnit().getPackageName(), "");
             }
         }
 
-        // If the entire query was consumed, we found what we were looking for
-        return iQuery == query.length();
-    }
+        FindDeclarations scan = new FindDeclarations();
 
-    private class Indexer extends BaseScanner {
-        private SourceFileIndex index;
-
-        public Indexer(Context context) {
-            super(context);
-        }
-
-        @Override
-        public void visitTopLevel(JCTree.JCCompilationUnit tree) {
-            URI uri = tree.getSourceFile().toUri();
-
-            index = new SourceFileIndex();
-            sourcePath.put(uri, index);
-
-            super.visitTopLevel(tree);
-
-        }
-
-        @Override
-        public void visitClassDef(JCTree.JCClassDecl tree) {
-            super.visitClassDef(tree);
-
-            addDeclaration(tree, tree.sym);
-        }
-
-        @Override
-        public void visitMethodDef(JCTree.JCMethodDecl tree) {
-            super.visitMethodDef(tree);
-
-            addDeclaration(tree, tree.sym);
-        }
-
-        @Override
-        public void visitVarDef(JCTree.JCVariableDecl tree) {
-            super.visitVarDef(tree);
-
-            addDeclaration(tree, tree.sym);
-        }
-
-        @Override
-        public void visitSelect(JCTree.JCFieldAccess tree) {
-            super.visitSelect(tree);
-
-            addReference(tree, tree.sym);
-        }
-
-        @Override
-        public void visitReference(JCTree.JCMemberReference tree) {
-            super.visitReference(tree);
-
-            addReference(tree, tree.sym);
-        }
-
-        @Override
-        public void visitIdent(JCTree.JCIdent tree) {
-            addReference(tree, tree.sym);
-        }
-
-        @Override
-        public void visitNewClass(JCTree.JCNewClass tree) {
-            super.visitNewClass(tree);
-
-            addReference(tree, tree.constructor);
-        }
-
-        private void addDeclaration(JCTree tree, Symbol symbol) {
-            if (symbol != null && onSourcePath(symbol) && shouldIndex(symbol)) {
-                String key = uniqueName(symbol);
-                SymbolInformationImpl info = symbolInformation(tree, symbol, compilationUnit);
-                Map<String, SymbolInformation> withKind = index.declarations.computeIfAbsent(symbol.getKind(), newKind -> new HashMap<>());
-
-                withKind.put(key, info);
-            }
-        }
-
-        private void addReference(JCTree tree, Symbol symbol) {
-            if (symbol != null && onSourcePath(symbol) && shouldIndex(symbol)) {
-                String key = uniqueName(symbol);
-                Map<String, Set<Location>> withKind = index.references.computeIfAbsent(symbol.getKind(), newKind -> new HashMap<>());
-                Set<Location> locations = withKind.computeIfAbsent(key, newName -> new HashSet<>());
-                LocationImpl location = location(tree, compilationUnit);
-
-                locations.add(location);
-            }
-        }
-    }
-
-    public static boolean shouldIndex(Symbol symbol) {
-        ElementKind kind = symbol.getKind();
-
-        switch (kind) {
-            case ENUM:
-            case ANNOTATION_TYPE:
-            case INTERFACE:
-            case ENUM_CONSTANT:
-            case FIELD:
-            case METHOD:
-                return true;
-            case CLASS:
-                return !symbol.isAnonymous();
-            case CONSTRUCTOR:
-                // TODO also skip generated constructors
-                return !symbol.getEnclosingElement().isAnonymous();
-            default:
-                return false;
-        }
-    }
-
-    private static SymbolInformationImpl symbolInformation(JCTree tree, Symbol symbol, JCTree.JCCompilationUnit compilationUnit) {
-        LocationImpl location = location(tree, compilationUnit);
-        SymbolInformationImpl info = new SymbolInformationImpl();
-
-        info.setContainerName(symbol.getEnclosingElement().getQualifiedName().toString());
-        info.setKind(symbolInformationKind(symbol.getKind()));
-        
-        // Constructors have name <init>, use class name instead
-        if (symbol.getKind() == ElementKind.CONSTRUCTOR)
-            info.setName(symbol.getEnclosingElement().getSimpleName().toString());            
-        else
-            info.setName(symbol.getSimpleName().toString());
-
-        info.setLocation(location);
-
-        return info;
-    }
-
-    public static LocationImpl location(JCTree tree, JCTree.JCCompilationUnit compilationUnit) {
         try {
-            // Declaration should include offset
-            int offset = tree.pos;
-            int end = tree.getEndPosition(null);
+            CompilationUnitTree tree = task.parse().iterator().next();
 
-            // If symbol is a class, offset points to 'class' keyword, not name
-            // Find the name by searching the text of the source, starting at the 'class' keyword
-            if (tree instanceof JCTree.JCClassDecl) {
-                Symbol.ClassSymbol symbol = ((JCTree.JCClassDecl) tree).sym;
-                offset = offset(compilationUnit, symbol, offset);
-                end = offset + symbol.name.length();
-            }
-            else if (tree instanceof JCTree.JCMethodDecl) {
-                Symbol.MethodSymbol symbol = ((JCTree.JCMethodDecl) tree).sym;
-                offset = offset(compilationUnit, symbol, offset);
-                end = offset + symbol.name.length();
-            }
-            else if (tree instanceof JCTree.JCVariableDecl) {
-                Symbol.VarSymbol symbol = ((JCTree.JCVariableDecl) tree).sym;
-                offset = offset(compilationUnit, symbol, offset);
-                end = offset + symbol.name.length();
-            }
+            scan.scan(tree, null);
 
-            RangeImpl position = JavaLanguageServer.findPosition(compilationUnit.getSourceFile(),
-                                                                 offset,
-                                                                 end);
-            LocationImpl location = new LocationImpl();
-
-            location.setUri(compilationUnit.getSourceFile().toUri().toString());
-            location.setRange(position);
-
-            return location;
+            return scan.result.stream();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private static int offset(JCTree.JCCompilationUnit compilationUnit,
-                              Symbol symbol,
-                              int estimate) throws IOException {
-        CharSequence content = compilationUnit.sourcefile.getCharContent(false);
-        Name name = symbol.getSimpleName();
+    boolean isTopLevelClass(String qualifiedName) {
+        return doFindDeclaringFile(qualifiedName).isPresent();
+    }
 
-        estimate = indexOf(content, name, estimate);
-        return estimate;
+    Stream<ReachableClass> accessibleTopLevelClasses(String fromPackage) {
+        finishedInitialIndex.join();
+
+        return sourcePathFiles.values().stream().flatMap(doAccessibleTopLevelClasses(fromPackage));
+    }
+
+    private Function<SourceFileIndex, Stream<ReachableClass>> doAccessibleTopLevelClasses(
+            String fromPackage) {
+        return index ->
+                index.topLevelClasses
+                        .stream()
+                        .filter(c -> c.publicClass || c.packageName.equals(fromPackage));
+    }
+
+    Stream<ReachableClass> allTopLevelClasses() {
+        finishedInitialIndex.join();
+
+        return sourcePathFiles.values().stream().flatMap(index -> index.topLevelClasses.stream());
+    }
+
+    Optional<URI> findDeclaringFile(TypeElement topLevelClass) {
+        updateOpenFiles();
+
+        String qualifiedName = topLevelClass.getQualifiedName().toString();
+
+        return doFindDeclaringFile(qualifiedName);
+    }
+
+    private Optional<URI> doFindDeclaringFile(String qualifiedName) {
+        String packageName = Completions.mostIds(qualifiedName),
+                className = Completions.lastId(qualifiedName);
+        Predicate<Map.Entry<URI, SourceFileIndex>> containsClass =
+                entry -> {
+                    SourceFileIndex index = entry.getValue();
+
+                    return index.packageName.equals(packageName)
+                            && index.topLevelClasses
+                                    .stream()
+                                    .anyMatch(c -> c.className.equals(className));
+                };
+
+        return sourcePathFiles
+                .entrySet()
+                .stream()
+                .filter(containsClass)
+                .map(entry -> entry.getKey())
+                .findFirst();
+    }
+
+    /** Update a file in the index */
+    private void update(CompilationUnitTree compilationUnit) {
+        URI file = compilationUnit.getSourceFile().toUri();
+        SourceFileIndex index = new SourceFileIndex();
+
+        index.packageName = Objects.toString(compilationUnit.getPackageName(), "");
+
+        new TreePathScanner<Void, Void>() {
+            int classDepth = 0;
+
+            @Override
+            public Void visitClass(ClassTree node, Void aVoid) {
+                // If this is a top-level class, add qualified name to special topLevelClasses index
+                if (classDepth == 0) {
+                    String className = node.getSimpleName().toString();
+                    Set<Modifier> flags = node.getModifiers().getFlags();
+                    boolean publicClass = flags.contains(Modifier.PUBLIC),
+                            hasTypeParameters = !node.getTypeParameters().isEmpty();
+                    boolean publicConstructor = false, packagePrivateConstructor = false;
+                    boolean hasExplicitConstructors = false;
+
+                    for (Tree each : node.getMembers()) {
+                        if (each instanceof MethodTree) {
+                            MethodTree method = (MethodTree) each;
+
+                            if (method.getName().contentEquals("<init>")) {
+                                hasExplicitConstructors = true;
+
+                                Set<Modifier> methodFlags = method.getModifiers().getFlags();
+
+                                if (publicClass && methodFlags.contains(Modifier.PUBLIC))
+                                    publicConstructor = true;
+                                else if (!methodFlags.contains(Modifier.PROTECTED)
+                                        && !methodFlags.contains(Modifier.PRIVATE))
+                                    packagePrivateConstructor = true;
+                            }
+                        }
+                    }
+
+                    if (!hasExplicitConstructors) {
+                        publicConstructor = publicClass;
+                        packagePrivateConstructor = !publicClass;
+                    }
+
+                    index.topLevelClasses.add(
+                            new ReachableClass(
+                                    index.packageName,
+                                    className,
+                                    publicClass,
+                                    publicConstructor,
+                                    packagePrivateConstructor,
+                                    hasTypeParameters));
+                }
+
+                // Add simple name to declarations
+                index.declarations.add(node.getSimpleName().toString());
+
+                // Recurse, but remember that anything inside isn't a top-level class
+                classDepth++;
+                super.visitClass(node, aVoid);
+                classDepth--;
+
+                return null;
+            }
+
+            @Override
+            public Void visitMethod(MethodTree node, Void aVoid) {
+                index.declarations.add(node.getName().toString());
+
+                return super.visitMethod(node, aVoid);
+            }
+
+            @Override
+            public Void visitVariable(VariableTree node, Void aVoid) {
+                if (getCurrentPath().getParentPath().getLeaf().getKind() == Tree.Kind.CLASS)
+                    index.declarations.add(node.getName().toString());
+
+                return super.visitVariable(node, aVoid);
+            }
+
+            @Override
+            public Void visitMemberSelect(MemberSelectTree node, Void aVoid) {
+                index.references.add(node.getIdentifier().toString());
+
+                return super.visitMemberSelect(node, aVoid);
+            }
+
+            @Override
+            public Void visitMemberReference(MemberReferenceTree node, Void aVoid) {
+                index.references.add(node.getName().toString());
+
+                return super.visitMemberReference(node, aVoid);
+            }
+
+            @Override
+            public Void visitIdentifier(IdentifierTree node, Void aVoid) {
+                index.references.add(node.getName().toString());
+
+                return super.visitIdentifier(node, aVoid);
+            }
+        }.scan(compilationUnit, null);
+
+        sourcePathFiles.put(file, index);
+    }
+
+    Collection<URI> potentialReferences(String name) {
+        updateOpenFiles();
+
+        Map<URI, SourceFileIndex> hasName =
+                Maps.filterValues(sourcePathFiles, index -> index.references.contains(name));
+
+        return hasName.keySet();
+    }
+
+    /** Find a more accurate position for expression tree by searching for its name. */
+    static Optional<Location> findTreeName(CharSequence name, TreePath path, Trees trees) {
+        if (path == null) return Optional.empty();
+
+        SourcePositions sourcePositions = trees.getSourcePositions();
+        CompilationUnitTree compilationUnit = path.getCompilationUnit();
+        long startExpr = sourcePositions.getStartPosition(compilationUnit, path.getLeaf());
+
+        if (startExpr == Diagnostic.NOPOS) return Optional.empty();
+
+        CharSequence content;
+        try {
+            content = compilationUnit.getSourceFile().getCharContent(false);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        int startSymbol = indexOf(content, name, (int) startExpr);
+
+        if (startSymbol == -1) return Optional.empty();
+
+        int line = (int) compilationUnit.getLineMap().getLineNumber(startSymbol);
+        int column = (int) compilationUnit.getLineMap().getColumnNumber(startSymbol);
+
+        return Optional.of(
+                new Location(
+                        compilationUnit.getSourceFile().toUri().toString(),
+                        new Range(
+                                new Position(line - 1, column - 1),
+                                new Position(line - 1, column + name.length() - 1))));
     }
 
     /**
      * Adapted from java.util.String.
      *
-     * The source is the character array being searched, and the target
-     * is the string being searched for.
+     * <p>The source is the character array being searched, and the target is the string being
+     * searched for.
      *
-     * @param   source       the characters being searched.
-     * @param   target       the characters being searched for.
-     * @param   fromIndex    the index to begin searching from.
+     * @param source the characters being searched.
+     * @param target the characters being searched for.
+     * @param fromIndex the index to begin searching from.
      */
     private static int indexOf(CharSequence source, CharSequence target, int fromIndex) {
-        int sourceOffset = 0, sourceCount = source.length(), targetOffset = 0, targetCount = target.length();
+        int sourceOffset = 0,
+                sourceCount = source.length(),
+                targetOffset = 0,
+                targetCount = target.length();
 
         if (fromIndex >= sourceCount) {
             return (targetCount == 0 ? sourceCount : -1);
@@ -386,14 +477,16 @@ public class SymbolIndex {
         for (int i = sourceOffset + fromIndex; i <= max; i++) {
             /* Look for first character. */
             if (source.charAt(i) != first) {
-                while (++i <= max && source.charAt(i) != first);
+                while (++i <= max && source.charAt(i) != first) ;
             }
 
-            /* Found first character, now look at the rest of v2 */
+            /* Found first character, now look apply the rest of v2 */
             if (i <= max) {
                 int j = i + 1;
                 int end = j + targetCount - 1;
-                for (int k = targetOffset + 1; j < end && source.charAt(j) == target.charAt(k); j++, k++);
+                for (int k = targetOffset + 1;
+                        j < end && source.charAt(j) == target.charAt(k);
+                        j++, k++) ;
 
                 if (j == end) {
                     /* Found whole string. */
@@ -402,27 +495,6 @@ public class SymbolIndex {
             }
         }
         return -1;
-    }
-
-    private static boolean onSourcePath(Symbol symbol) {
-        return true; // TODO
-    }
-
-    private static String uniqueName(Symbol s) {
-        StringJoiner acc = new StringJoiner(".");
-
-        createUniqueName(s, acc);
-
-        return acc.toString();
-    }
-
-    private static void createUniqueName(Symbol s, StringJoiner acc) {
-        if (s != null) {
-            createUniqueName(s.owner, acc);
-
-            if (!s.getSimpleName().isEmpty())
-                acc.add(s.getSimpleName().toString());
-        }
     }
 
     private static SymbolKind symbolInformationKind(ElementKind kind) {
@@ -457,19 +529,28 @@ public class SymbolIndex {
         }
     }
 
-    /**
-     * Update the index when a files changes
-     */
-    public void update(JCTree.JCCompilationUnit tree, Context context) {
-        Indexer indexer = new Indexer(context);
-
-        tree.accept(indexer);
+    private CompilationUnitTree parse(URI source) {
+        try {
+            return parseTask(source).parse().iterator().next();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
 
-    /**
-     * Clear a file from the index when it is deleted
-     */
-    public void clear(URI sourceFile) {
-        sourcePath.remove(sourceFile);
+    private JavacTask parseTask(URI source) {
+        Optional<String> content = activeContent.apply(source);
+        JavaFileObject file =
+                content.map(text -> (JavaFileObject) new StringFileObject(text, source))
+                        .orElseGet(() -> emptyFileManager.getRegularFile(new File(source)));
+
+        return parser.getTask(
+                null,
+                emptyFileManager,
+                err -> LOG.warning(err.getMessage(Locale.getDefault())),
+                Collections.emptyList(),
+                null,
+                Collections.singletonList(file));
     }
+
+    private static final Logger LOG = Logger.getLogger("main");
 }

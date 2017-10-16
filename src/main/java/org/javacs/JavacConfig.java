@@ -5,13 +5,12 @@ import java.util.Objects;
 import java.util.Set;
 
 public class JavacConfig {
-    public final Set<Path> sourcePath, classPath;
-    public final Path outputDirectory;
+    public final Set<Path> classPath, workspaceClassPath, docPath;
 
-    public JavacConfig(Set<Path> sourcePath, Set<Path> classPath, Path outputDirectory) {
-        this.sourcePath = sourcePath;
+    public JavacConfig(Set<Path> classPath, Set<Path> workspaceClassPath, Set<Path> docPath) {
         this.classPath = classPath;
-        this.outputDirectory = outputDirectory;
+        this.workspaceClassPath = workspaceClassPath;
+        this.docPath = docPath;
     }
 
     @Override
@@ -19,13 +18,13 @@ public class JavacConfig {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         JavacConfig that = (JavacConfig) o;
-        return Objects.equals(sourcePath, that.sourcePath) &&
-               Objects.equals(classPath, that.classPath) &&
-               Objects.equals(outputDirectory, that.outputDirectory);
+        return Objects.equals(classPath, that.classPath)
+                && Objects.equals(workspaceClassPath, that.workspaceClassPath)
+                && Objects.equals(docPath, that.docPath);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(sourcePath, classPath, outputDirectory);
+        return Objects.hash(classPath, workspaceClassPath, docPath);
     }
 }

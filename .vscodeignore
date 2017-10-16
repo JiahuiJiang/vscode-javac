@@ -2,7 +2,6 @@
 .vscode/**
 .idea/**
 *.iml
-javaconfig.json
 classpath.txt
 tsconfig.json
 tsd.json
@@ -12,11 +11,9 @@ tsd.json
 *.log*
 
 # Sources
-typings/**
 src/**
 test/**
 lib/**
-!lib/javaconfig.schema.json
 repo/**
 scripts/**
 
